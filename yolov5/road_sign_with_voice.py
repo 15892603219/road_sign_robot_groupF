@@ -1,63 +1,94 @@
 import torch
 import cv2
 import pyttsx3
-import queue
+import speech_recognition as sr
 import threading
+import time
 
 # 初始化语音播报引擎
 engine = pyttsx3.init()
-engine.setProperty('rate', 150)  # 设置语速
+engine.setProperty('rate', 150)
 
-# 初始化队列用于处理检测结果
-result_queue = queue.Queue()
+# 加载 YOLOv5 模型
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+model = torch.hub.load('ultralytics/yolov5', 'yolov5n', pretrained=True).to(device)
 
-# 加载预训练的 YOLOv5 模型
-model = torch.hub.load('ultralytics/yolov5', 'yolov5n', force_reload=True)
+# 路标说明字典
+road_sign_info = {
+    "stop sign": "This is a stop sign, please stop and check if the surroundings are safe.",
+    "speed limit": "This is a speed limit sign, recommended speed is 50 kilometers per hour."
+}
 
-# 摄像头视频捕获
-cap = cv2.VideoCapture(0)  # 0 是默认摄像头设备
+# 摄像头设置
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap.set(cv2.CAP_PROP_FPS, 30)
 
-def voice_alert():
-    """语音播报线程函数"""
+# 异步语音识别线程
+user_command = None
+def listen_and_recognize():
+    global user_command
+    recognizer = sr.Recognizer()
     while True:
-        result = result_queue.get()  # 从队列中获取检测结果
-        if result == "STOP":  # 停止信号
-            break
-        engine.say(result)
-        engine.runAndWait()
+        with sr.Microphone() as source:
+            try:
+                print("Listening for commands...")
+                audio = recognizer.listen(source, timeout=5)
+                user_command = recognizer.recognize_google(audio, language="zh-CN")
+                print(f"Recognized command: {user_command}")
+            except Exception as e:
+                print(f"Speech recognition error: {e}")
 
-# 启动语音播报线程
-voice_thread = threading.Thread(target=voice_alert, daemon=True)
-voice_thread.start()
+threading.Thread(target=listen_and_recognize, daemon=True).start()
 
+# 主循环
+frame_count = 0
+start_time = time.time()
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
         break
 
-    # YOLOv5 推理
-    results = model(frame)
-    results.render()  # 绘制检测框到图像
+    frame_count += 1
 
-    # 显示检测结果
-    cv2.imshow('Road Sign Detection', results.ims[0])
+    # 限制帧率为30FPS
+    if time.time() - start_time >= 0.033:
+        start_time = time.time()
 
-    # 解析检测结果
-    detected_objects = []
-    for *box, conf, cls in results.xywh[0]:
-        detected_objects.append(f"{results.names[int(cls)]} with confidence {conf:.2f}")
+        # YOLO 推理（每5帧进行一次）
+        if frame_count % 5 == 0:
+            results = model(frame)
+            results.render()
+            detected_signs = set()
+            for *box, conf, cls in results.xywh[0]:
+                detected_sign = results.names[int(cls)]
+                detected_signs.add(detected_sign)
+                if detected_sign in road_sign_info:
+                    print(f"Detected road sign: {detected_sign}")
+                    engine.say(road_sign_info[detected_sign])
+                    engine.runAndWait()
 
-    # 如果有检测到的目标，将结果放入队列进行语音播报
-    if detected_objects:
-        for obj in detected_objects:
-            result_queue.put(obj)
+        # 显示视频帧
+        if 'results' in locals():  # 确保 results 已定义
+            cv2.imshow('Road Sign Detection', results.ims[0])
+        else:
+            cv2.imshow('Road Sign Detection', frame)
+
+        # 检查用户语音命令
+        if user_command:
+            if "前方是什么" in user_command:
+                if detected_signs:
+                    engine.say(f"The road signs detected are: {', '.join(detected_signs)}")
+                else:
+                    engine.say("No road signs detected")
+                engine.runAndWait()
+                user_command = None  # 重置命令
 
     # 按 'q' 键退出
     if cv2.waitKey(1) & 0xFF == ord('q'):
-        result_queue.put("STOP")  # 向队列发送停止信号
         break
 
-# 释放资源
 cap.release()
 cv2.destroyAllWindows()
 
